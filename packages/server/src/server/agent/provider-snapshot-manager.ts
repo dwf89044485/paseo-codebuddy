@@ -51,6 +51,25 @@ export class ProviderSnapshotManager {
     return entriesToArray(entries);
   }
 
+  async getSnapshotReady(cwd?: string): Promise<ProviderSnapshotEntry[]> {
+    const cwdKey = normalizeCwdKey(cwd);
+    let snapshot = this.snapshots.get(cwdKey);
+
+    if (!snapshot) {
+      snapshot = this.resetSnapshotToLoading(cwdKey);
+    }
+
+    const hasLoadingEntries = Array.from(snapshot.values()).some(
+      (entry) => entry.status === "loading",
+    );
+    if (hasLoadingEntries || !snapshot.size) {
+      await this.warmUp(cwd);
+      snapshot = this.snapshots.get(cwdKey) ?? snapshot;
+    }
+
+    return entriesToArray(snapshot);
+  }
+
   async refresh(options: ProviderSnapshotRefreshOptions = {}): Promise<void> {
     const { cwd } = options;
     const cwdKey = normalizeCwdKey(cwd);

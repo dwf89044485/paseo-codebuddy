@@ -238,12 +238,12 @@ type WebSocketLike = {
 type SessionConnection = {
   session: Session;
   clientId: string;
+  clientType: WSHelloMessage["clientType"];
   appVersion: string | null;
   connectionLogger: pino.Logger;
   sockets: Set<WebSocketLike>;
   externalDisconnectCleanupTimeout: ReturnType<typeof setTimeout> | null;
 };
-
 type WebSocketRuntimeCounters = {
   connectedAwaitingHello: number;
   helloResumed: number;
@@ -720,14 +720,16 @@ export class VoiceAssistantWebSocketServer {
   private createSessionConnection(params: {
     ws: WebSocketLike;
     clientId: string;
+    clientType: WSHelloMessage["clientType"];
     appVersion: string | null;
     connectionLogger: pino.Logger;
   }): SessionConnection {
-    const { ws, clientId, appVersion, connectionLogger } = params;
+    const { ws, clientId, clientType, appVersion, connectionLogger } = params;
     let connection: SessionConnection | null = null;
 
     const session = new Session({
       clientId,
+      clientType,
       appVersion,
       onMessage: (msg) => {
         if (!connection) {
@@ -803,6 +805,7 @@ export class VoiceAssistantWebSocketServer {
     connection = {
       session,
       clientId,
+      clientType,
       appVersion,
       connectionLogger,
       sockets: new Set([ws]),
@@ -873,6 +876,10 @@ export class VoiceAssistantWebSocketServer {
         existing.appVersion = newAppVersion;
         existing.session.updateAppVersion(newAppVersion);
       }
+      if (message.clientType !== existing.clientType) {
+        existing.clientType = message.clientType;
+        existing.session.updateClientType(message.clientType);
+      }
       existing.sockets.add(ws);
       this.sessions.set(ws, existing);
       this.sendToClient(ws, this.createServerInfoMessage());
@@ -892,6 +899,7 @@ export class VoiceAssistantWebSocketServer {
     const connection = this.createSessionConnection({
       ws,
       clientId,
+      clientType: message.clientType,
       appVersion: message.appVersion ?? null,
       connectionLogger,
     });

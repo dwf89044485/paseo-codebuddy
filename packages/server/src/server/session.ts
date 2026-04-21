@@ -91,6 +91,7 @@ import type {
   AgentTimelineCursor,
   AgentTimelineFetchDirection,
   ManagedAgent,
+  ProviderAvailability,
 } from "./agent/agent-manager.js";
 import { scheduleAgentMetadataGeneration } from "./agent/agent-metadata-generator.js";
 import {
@@ -231,10 +232,13 @@ type GitMutationRefreshReason =
 const LEGACY_PROVIDER_IDS = new Set(["claude", "codex", "opencode"]);
 const MIN_VERSION_ALL_PROVIDERS = "0.1.45";
 const MIN_VERSION_FLEXIBLE_EDITOR_IDS = "0.1.50";
+const MOBILE_PROVIDER_ALIAS_SOURCE = "codebuddy";
+const MOBILE_PROVIDER_ALIAS_TARGET = "opencode";
+const MOBILE_PROVIDER_ALIAS_DEFAULT_MODE = "build";
 
 function isAppVersionAtLeast(appVersion: string | null, minVersion: string): boolean {
   if (!appVersion) return false;
-  // Strip prerelease suffix: "0.1.45-beta.4" -> "0.1.45"
+  // Strip RC/prerelease suffix: "0.1.45-rc.4" → "0.1.45"
   const base = appVersion.replace(/-.*$/, "");
   const parts = base.split(".").map(Number);
   const minParts = minVersion.split(".").map(Number);
@@ -475,6 +479,7 @@ type VoiceTranscriptionResultPayload = {
 
 export type SessionOptions = {
   clientId: string;
+  clientType?: "mobile" | "browser" | "cli" | "mcp";
   appVersion?: string | null;
   onMessage: (msg: SessionOutboundMessage) => void;
   onBinaryMessage?: (frame: Uint8Array) => void;
@@ -616,6 +621,7 @@ function convertPCMToWavBuffer(
  */
 export class Session {
   private readonly clientId: string;
+  private clientType: NonNullable<SessionOptions["clientType"]>;
   private appVersion: string | null;
   private readonly sessionId: string;
   private readonly onMessage: (msg: SessionOutboundMessage) => void;
@@ -728,6 +734,7 @@ export class Session {
   constructor(options: SessionOptions) {
     const {
       clientId,
+      clientType = "browser",
       appVersion,
       onMessage,
       onBinaryMessage,
@@ -766,6 +773,7 @@ export class Session {
       isDev,
     } = options;
     this.clientId = clientId;
+    this.clientType = clientType;
     this.appVersion = appVersion ?? null;
     this.sessionId = uuidv4();
     this.onMessage = onMessage;
@@ -807,9 +815,7 @@ export class Session {
     if (this.providerSnapshotManager) {
       const handleProviderSnapshotChange = (entries: ProviderSnapshotEntry[], cwd?: string) => {
         // COMPAT(providersSnapshot): keep provider visibility gating for older clients.
-        const visibleEntries = entries.filter((entry) =>
-          this.isProviderVisibleToClient(entry.provider),
-        );
+        const visibleEntries = this.transformProviderSnapshotEntriesForClient(entries);
         this.emit({
           type: "providers_snapshot_update",
           payload: {
@@ -862,6 +868,12 @@ export class Session {
   updateAppVersion(appVersion: string | null): void {
     if (appVersion && appVersion !== this.appVersion) {
       this.appVersion = appVersion;
+    }
+  }
+
+  updateClientType(clientType: NonNullable<SessionOptions["clientType"]>): void {
+    if (clientType !== this.clientType) {
+      this.clientType = clientType;
     }
   }
 
@@ -1194,18 +1206,112 @@ export class Session {
       }
     }
     payload.archivedAt = storedRecord?.archivedAt ?? null;
+    return this.mapAgentPayloadForClient(payload);
+  }
+
+  private mapAgentPayloadForClient(payload: AgentSnapshotPayload): AgentSnapshotPayload {
+    payload.provider = this.mapProviderForClient(payload.provider);
+    if (payload.runtimeInfo) {
+      payload.runtimeInfo.provider = this.mapProviderForClient(payload.runtimeInfo.provider);
+    }
+    if (payload.persistence) {
+      payload.persistence.provider = this.mapProviderForClient(payload.persistence.provider);
+    }
     return payload;
   }
 
   private buildStoredAgentPayload(record: StoredAgentRecord): AgentSnapshotPayload {
-    return buildStoredAgentPayload(record, this.providerRegistry, this.sessionLogger);
+    const payload = buildStoredAgentPayload(record, this.providerRegistry, this.sessionLogger);
+    return this.mapAgentPayloadForClient(payload);
+  }
+
+  private shouldUseMobileProviderAlias(): boolean {
+    return (
+      this.clientType === "mobile" &&
+      Object.prototype.hasOwnProperty.call(this.providerRegistry, MOBILE_PROVIDER_ALIAS_SOURCE)
+    );
+  }
+
+  private mapProviderForClient(provider: string): string {
+    if (this.shouldUseMobileProviderAlias() && provider === MOBILE_PROVIDER_ALIAS_SOURCE) {
+      return MOBILE_PROVIDER_ALIAS_TARGET;
+    }
+    return provider;
+  }
+
+  private mapProviderFromClient(provider: string): string {
+    if (this.shouldUseMobileProviderAlias() && provider === MOBILE_PROVIDER_ALIAS_TARGET) {
+      return MOBILE_PROVIDER_ALIAS_SOURCE;
+    }
+    return provider;
+  }
+
+  private mapModeIdFromClient(options: {
+    requestedProvider: string;
+    resolvedProvider: string;
+    modeId?: string;
+  }): string | undefined {
+    const { requestedProvider, resolvedProvider, modeId } = options;
+    if (!modeId) {
+      return undefined;
+    }
+
+    if (
+      this.shouldUseMobileProviderAlias() &&
+      requestedProvider === MOBILE_PROVIDER_ALIAS_TARGET &&
+      resolvedProvider === MOBILE_PROVIDER_ALIAS_SOURCE &&
+      modeId === MOBILE_PROVIDER_ALIAS_DEFAULT_MODE
+    ) {
+      return undefined;
+    }
+
+    return modeId;
   }
 
   private isProviderVisibleToClient(provider: string): boolean {
+    const providerForClient = this.mapProviderForClient(provider);
     if (clientSupportsAllProviders(this.appVersion)) {
       return true;
     }
-    return LEGACY_PROVIDER_IDS.has(provider);
+    return LEGACY_PROVIDER_IDS.has(providerForClient);
+  }
+
+  private transformProviderAvailabilityForClient(
+    providers: ProviderAvailability[],
+  ): ProviderAvailability[] {
+    const transformed = new Map<string, ProviderAvailability>();
+    for (const entry of providers) {
+      if (!this.isProviderVisibleToClient(entry.provider)) {
+        continue;
+      }
+      const providerForClient = this.mapProviderForClient(entry.provider);
+      const mappedEntry =
+        providerForClient === entry.provider ? entry : { ...entry, provider: providerForClient };
+      const existing = transformed.get(providerForClient);
+      if (!existing || entry.provider === MOBILE_PROVIDER_ALIAS_SOURCE) {
+        transformed.set(providerForClient, mappedEntry);
+      }
+    }
+    return Array.from(transformed.values());
+  }
+
+  private transformProviderSnapshotEntriesForClient(
+    entries: ProviderSnapshotEntry[],
+  ): ProviderSnapshotEntry[] {
+    const transformed = new Map<string, ProviderSnapshotEntry>();
+    for (const entry of entries) {
+      if (!this.isProviderVisibleToClient(entry.provider)) {
+        continue;
+      }
+      const providerForClient = this.mapProviderForClient(entry.provider);
+      const mappedEntry =
+        providerForClient === entry.provider ? entry : { ...entry, provider: providerForClient };
+      const existing = transformed.get(providerForClient);
+      if (!existing || entry.provider === MOBILE_PROVIDER_ALIAS_SOURCE) {
+        transformed.set(providerForClient, mappedEntry);
+      }
+    }
+    return Array.from(transformed.values());
   }
 
   private filterEditorsForClient(
@@ -2766,9 +2872,17 @@ export class Session {
       attachments,
       labels,
     } = msg;
+    const requestedProvider = config.provider;
+    const provider = this.mapProviderFromClient(requestedProvider);
+
     this.sessionLogger.info(
-      { cwd: config.cwd, provider: config.provider, worktreeName },
-      `Creating agent in ${config.cwd} (${config.provider})${
+      {
+        cwd: config.cwd,
+        provider: requestedProvider,
+        resolvedProvider: provider,
+        worktreeName,
+      },
+      `Creating agent in ${config.cwd} (${requestedProvider})${
         worktreeName ? ` with worktree ${worktreeName}` : ""
       }`,
     );
@@ -2779,8 +2893,16 @@ export class Session {
         configTitle: config.title,
         initialPrompt: trimmedPrompt,
       });
+      const { modeId: requestedModeId, ...configWithoutMode } = config;
+      const modeId = this.mapModeIdFromClient({
+        requestedProvider,
+        resolvedProvider: provider,
+        modeId: requestedModeId,
+      });
       const resolvedConfig: AgentSessionConfig = {
-        ...config,
+        ...configWithoutMode,
+        provider,
+        ...(modeId ? { modeId } : {}),
         ...(provisionalTitle ? { title: provisionalTitle } : {}),
       };
 
@@ -3074,14 +3196,16 @@ export class Session {
     const cwd = msg.cwd ? expandTilde(msg.cwd) : undefined;
     const fetchedAt = new Date().toISOString();
     const manager = this.providerSnapshotManager;
+    const provider = this.mapProviderFromClient(msg.provider);
+    const providerForClient = this.mapProviderForClient(provider);
 
     if (!manager) {
       try {
-        const models = await this.providerRegistry[msg.provider].fetchModels({ cwd });
+        const models = await this.providerRegistry[provider].fetchModels({ cwd });
         this.emit({
           type: "list_provider_models_response",
           payload: {
-            provider: msg.provider,
+            provider: providerForClient,
             models,
             error: null,
             fetchedAt,
@@ -3090,13 +3214,13 @@ export class Session {
         });
       } catch (error) {
         this.sessionLogger.error(
-          { err: error, provider: msg.provider },
-          `Failed to list models for ${msg.provider}`,
+          { err: error, requestedProvider: msg.provider, provider },
+          `Failed to list models for ${provider}`,
         );
         this.emit({
           type: "list_provider_models_response",
           payload: {
-            provider: msg.provider,
+            provider: providerForClient,
             error: (error as Error)?.message ?? String(error),
             fetchedAt,
             requestId: msg.requestId,
@@ -3107,13 +3231,13 @@ export class Session {
     }
 
     const findEntry = () =>
-      manager.getSnapshot(cwd).find((candidate) => candidate.provider === msg.provider);
+      manager.getSnapshot(cwd).find((candidate) => candidate.provider === provider);
 
     let entry = findEntry();
     if (!entry || entry.status === "loading") {
       // Awaits the in-flight warmup (deduped per-cwd) so old clients still get
       // a resolved answer rather than a loading placeholder.
-      await manager.refresh({ cwd, providers: [msg.provider] });
+      await manager.refresh({ cwd, providers: [provider] });
       entry = findEntry();
     }
 
@@ -3121,8 +3245,8 @@ export class Session {
       this.emit({
         type: "list_provider_models_response",
         payload: {
-          provider: msg.provider,
-          error: `Unknown provider: ${msg.provider}`,
+          provider: providerForClient,
+          error: `Unknown provider: ${provider}`,
           fetchedAt,
           requestId: msg.requestId,
         },
@@ -3134,7 +3258,7 @@ export class Session {
       this.emit({
         type: "list_provider_models_response",
         payload: {
-          provider: msg.provider,
+          provider: providerForClient,
           models: entry.models ?? [],
           error: null,
           fetchedAt: entry.fetchedAt ?? fetchedAt,
@@ -3146,13 +3270,13 @@ export class Session {
 
     const errorMessage =
       entry.status === "error"
-        ? (entry.error ?? `Failed to list models for ${msg.provider}`)
-        : `Provider ${msg.provider} is not available`;
+        ? (entry.error ?? `Failed to list models for ${provider}`)
+        : `Provider ${provider} is not available`;
 
     this.emit({
       type: "list_provider_models_response",
       payload: {
-        provider: msg.provider,
+        provider: providerForClient,
         error: errorMessage,
         fetchedAt,
         requestId: msg.requestId,
@@ -3164,14 +3288,16 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "list_provider_modes_request" }>,
   ): Promise<void> {
     const fetchedAt = new Date().toISOString();
+    const provider = this.mapProviderFromClient(msg.provider);
+    const providerForClient = this.mapProviderForClient(provider);
     try {
-      const modes = await this.providerRegistry[msg.provider].fetchModes({
+      const modes = await this.providerRegistry[provider].fetchModes({
         cwd: msg.cwd ? expandTilde(msg.cwd) : undefined,
       });
       this.emit({
         type: "list_provider_modes_response",
         payload: {
-          provider: msg.provider,
+          provider: providerForClient,
           modes,
           error: null,
           fetchedAt,
@@ -3180,13 +3306,13 @@ export class Session {
       });
     } catch (error) {
       this.sessionLogger.error(
-        { err: error, provider: msg.provider },
-        `Failed to list modes for ${msg.provider}`,
+        { err: error, requestedProvider: msg.provider, provider },
+        `Failed to list modes for ${provider}`,
       );
       this.emit({
         type: "list_provider_modes_response",
         payload: {
-          provider: msg.provider,
+          provider: providerForClient,
           error: (error as Error)?.message ?? String(error),
           fetchedAt,
           requestId: msg.requestId,
@@ -3203,10 +3329,18 @@ export class Session {
     thinkingOptionId?: string;
     featureValues?: Record<string, unknown>;
   }): AgentSessionConfig {
+    const requestedProvider = draftConfig.provider;
+    const provider = this.mapProviderFromClient(requestedProvider);
+    const modeId = this.mapModeIdFromClient({
+      requestedProvider,
+      resolvedProvider: provider,
+      modeId: draftConfig.modeId,
+    });
+
     return {
-      provider: draftConfig.provider,
+      provider,
       cwd: expandTilde(draftConfig.cwd),
-      ...(draftConfig.modeId ? { modeId: draftConfig.modeId } : {}),
+      ...(modeId ? { modeId } : {}),
       ...(draftConfig.model ? { model: draftConfig.model } : {}),
       ...(draftConfig.thinkingOptionId ? { thinkingOptionId: draftConfig.thinkingOptionId } : {}),
       ...(draftConfig.featureValues ? { featureValues: draftConfig.featureValues } : {}),
@@ -3217,13 +3351,16 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "list_provider_features_request" }>,
   ): Promise<void> {
     const fetchedAt = new Date().toISOString();
+    const requestedProvider = msg.draftConfig.provider;
+    const provider = this.mapProviderFromClient(requestedProvider);
+    const providerForClient = this.mapProviderForClient(provider);
     try {
       const sessionConfig = this.buildDraftAgentSessionConfig(msg.draftConfig);
       const features = await this.agentManager.listDraftFeatures(sessionConfig);
       this.emit({
         type: "list_provider_features_response",
         payload: {
-          provider: msg.draftConfig.provider,
+          provider: providerForClient,
           features,
           error: null,
           fetchedAt,
@@ -3232,13 +3369,18 @@ export class Session {
       });
     } catch (error) {
       this.sessionLogger.error(
-        { err: error, provider: msg.draftConfig.provider, draftConfig: msg.draftConfig },
-        `Failed to list features for ${msg.draftConfig.provider}`,
+        {
+          err: error,
+          requestedProvider,
+          provider,
+          draftConfig: msg.draftConfig,
+        },
+        `Failed to list features for ${provider}`,
       );
       this.emit({
         type: "list_provider_features_response",
         payload: {
-          provider: msg.draftConfig.provider,
+          provider: providerForClient,
           error: (error as Error)?.message ?? String(error),
           fetchedAt,
           requestId: msg.requestId,
@@ -3252,8 +3394,8 @@ export class Session {
   ): Promise<void> {
     const fetchedAt = new Date().toISOString();
     try {
-      const providers = (await this.agentManager.listProviderAvailability()).filter((provider) =>
-        this.isProviderVisibleToClient(provider.provider),
+      const providers = this.transformProviderAvailabilityForClient(
+        await this.agentManager.listProviderAvailability(),
       );
       this.emit({
         type: "list_available_providers_response",
@@ -3282,10 +3424,11 @@ export class Session {
     msg: Extract<SessionInboundMessage, { type: "get_providers_snapshot_request" }>,
   ): Promise<void> {
     // COMPAT(providersSnapshot): keep legacy provider-list RPCs alongside snapshot flow.
+    const cwd = msg.cwd ? expandTilde(msg.cwd) : undefined;
     const entries = this.providerSnapshotManager
-      ? this.providerSnapshotManager
-          .getSnapshot(msg.cwd ? expandTilde(msg.cwd) : undefined)
-          .filter((entry) => this.isProviderVisibleToClient(entry.provider))
+      ? this.transformProviderSnapshotEntriesForClient(
+          await this.providerSnapshotManager.getSnapshotReady(cwd),
+        )
       : [];
 
     this.emit({
@@ -3301,9 +3444,10 @@ export class Session {
   private async handleRefreshProvidersSnapshotRequest(
     msg: Extract<SessionInboundMessage, { type: "refresh_providers_snapshot_request" }>,
   ): Promise<void> {
+    const providers = msg.providers?.map((provider) => this.mapProviderFromClient(provider));
     await this.providerSnapshotManager?.refresh({
       cwd: msg.cwd ? expandTilde(msg.cwd) : undefined,
-      providers: msg.providers,
+      providers,
     });
     this.emit({
       type: "refresh_providers_snapshot_response",
@@ -3317,15 +3461,17 @@ export class Session {
   private async handleProviderDiagnosticRequest(
     msg: Extract<SessionInboundMessage, { type: "provider_diagnostic_request" }>,
   ): Promise<void> {
+    const provider = this.mapProviderFromClient(msg.provider);
+    const providerForClient = this.mapProviderForClient(provider);
     try {
-      const client = this.providerRegistry[msg.provider].createClient(this.sessionLogger);
+      const client = this.providerRegistry[provider].createClient(this.sessionLogger);
       const diagnostic = client.getDiagnostic
         ? (await client.getDiagnostic()).diagnostic
         : "No diagnostic available for this provider.";
       this.emit({
         type: "provider_diagnostic_response",
         payload: {
-          provider: msg.provider,
+          provider: providerForClient,
           diagnostic,
           requestId: msg.requestId,
         },
@@ -3333,8 +3479,8 @@ export class Session {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       this.sessionLogger.error(
-        { err, provider: msg.provider },
-        `Failed to get provider diagnostic for ${msg.provider}`,
+        { err, requestedProvider: msg.provider, provider },
+        `Failed to get provider diagnostic for ${provider}`,
       );
       this.emit({
         type: "rpc_error",
